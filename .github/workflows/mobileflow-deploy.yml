@@ -1,0 +1,64 @@
+name: MobileFlow Deploy
+run-name: "MobileFlow deploy ${{ inputs.deploy_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_id:
+        description: 'Identifiant du déploiement MobileFlow'
+        required: true
+      source_build_id:
+        description: "Identifiant du build source dont l'IPA doit être retéléchargé"
+        required: true
+      source_run_id:
+        description: 'Run GitHub Actions du build source, pour le téléchargement cross-run de son artefact'
+        required: true
+      api_url:
+        description: "URL publique de l'API MobileFlow"
+        required: true
+      deploy_secrets_token:
+        description: "Token de déploiement à usage unique pour récupérer la clé App Store Connect"
+        required: true
+
+# Seul droit nécessaire : lire l'artefact d'un run précédent de ce repo.
+permissions:
+  actions: read
+
+jobs:
+  deploy-ios:
+    runs-on: macos-latest
+    steps:
+      - name: Fetch deploy secrets
+        env:
+          DEPLOY_SECRETS_TOKEN: ${{ inputs.deploy_secrets_token }}
+          API_URL: ${{ inputs.api_url }}
+        run: |
+          RESPONSE=$(curl -sf -H "Authorization: Bearer $DEPLOY_SECRETS_TOKEN" "$API_URL/internal/deploy-secrets")
+          if [ "$(echo "$RESPONSE" | jq -r '.appStoreConnectKey')" = "null" ]; then
+            echo "::error::Aucune équipe Apple Developer (clé App Store Connect) configurée pour ce projet."
+            exit 1
+          fi
+          ISSUER_ID=$(echo "$RESPONSE" | jq -r '.appStoreConnectKey.issuerId')
+          KEY_ID=$(echo "$RESPONSE" | jq -r '.appStoreConnectKey.keyId')
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo "$RESPONSE" | jq -r '.appStoreConnectKey.privateKeyPem' > ~/.appstoreconnect/private_keys/AuthKey_$KEY_ID.p8
+          echo "ISSUER_ID=$ISSUER_ID" >> "$GITHUB_ENV"
+          echo "KEY_ID=$KEY_ID" >> "$GITHUB_ENV"
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mobileflow-${{ inputs.source_build_id }}-ios
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.source_run_id }}
+          path: ${{ runner.temp }}/deploy-artifact
+      - name: Upload to App Store Connect
+        run: |
+          IPA_PATH=$(find "$RUNNER_TEMP/deploy-artifact" -name '*.ipa' | head -n 1)
+          if [ -z "$IPA_PATH" ]; then
+            echo "::error::IPA introuvable dans l'artefact téléchargé."
+            exit 1
+          fi
+          xcrun altool --upload-app -f "$IPA_PATH" -t ios --apiKey "$KEY_ID" --apiIssuer "$ISSUER_ID"
+      - name: Clean up App Store Connect key
+        if: always()
+        run: rm -f ~/.appstoreconnect/private_keys/AuthKey_*.p8
