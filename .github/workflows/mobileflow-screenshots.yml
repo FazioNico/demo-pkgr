@@ -1,0 +1,183 @@
+name: MobileFlow Screenshots
+run-name: "MobileFlow screenshots ${{ inputs.capture_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      capture_id:
+        description: 'Identifiant de la capture MobileFlow'
+        required: true
+      source_sha:
+        description: 'Commit à builder et capturer (celui du build déployé)'
+        required: true
+      api_url:
+        description: "URL publique de l'API MobileFlow"
+        required: true
+      capture_token:
+        description: "Token à courte durée de vie limité à l'envoi des captures de cette capture"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  capture-screenshots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: npm run build
+      - name: Install capture tooling
+        run: |
+          mkdir -p "$RUNNER_TEMP/mobileflow-capture"
+          cd "$RUNNER_TEMP/mobileflow-capture"
+          npm init -y > /dev/null
+          npm install playwright-core@1
+          npx playwright-core install --with-deps chromium
+      - name: Capture screenshots
+        env:
+          API_URL: ${{ inputs.api_url }}
+          CAPTURE_TOKEN: ${{ inputs.capture_token }}
+        run: |
+          cat > "$RUNNER_TEMP/mobileflow-capture/capture.cjs" <<'MOBILEFLOW_CAPTURE_SCRIPT'
+          const fs = require('node:fs');
+          const http = require('node:http');
+          const path = require('node:path');
+          const { chromium } = require('playwright-core');
+
+          const API_URL = process.env.API_URL;
+          const CAPTURE_TOKEN = process.env.CAPTURE_TOKEN;
+          const WORKSPACE = process.env.GITHUB_WORKSPACE;
+          const CONTENT_TYPES = {
+            '.html': 'text/html; charset=utf-8',
+            '.js': 'text/javascript; charset=utf-8',
+            '.mjs': 'text/javascript; charset=utf-8',
+            '.css': 'text/css; charset=utf-8',
+            '.json': 'application/json',
+            '.map': 'application/json',
+            '.txt': 'text/plain; charset=utf-8',
+            '.svg': 'image/svg+xml',
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.gif': 'image/gif',
+            '.webp': 'image/webp',
+            '.ico': 'image/x-icon',
+            '.woff': 'font/woff',
+            '.woff2': 'font/woff2',
+            '.ttf': 'font/ttf',
+          };
+
+          function callApi(pathname, init) {
+            const options = init || {};
+            return fetch(API_URL + '/internal/app-store-screenshots' + pathname, {
+              method: options.method,
+              body: options.body,
+              headers: Object.assign({ Authorization: 'Bearer ' + CAPTURE_TOKEN }, options.headers),
+            });
+          }
+
+          function isInside(root, target) {
+            return target === root || target.startsWith(root + path.sep);
+          }
+
+          function startStaticServer(root) {
+            const indexFile = path.join(root, 'index.html');
+            const server = http.createServer((req, res) => {
+              let file = indexFile;
+              try {
+                const requested = path.join(root, decodeURIComponent(new URL(req.url, 'http://localhost').pathname));
+                if (isInside(root, requested) && fs.existsSync(requested) && fs.statSync(requested).isFile()) {
+                  file = requested;
+                }
+              } catch (error) {
+                // URL illisible : on retombe sur index.html comme pour toute route inconnue d'une SPA.
+              }
+              res.writeHead(200, { 'Content-Type': CONTENT_TYPES[path.extname(file)] || 'application/octet-stream' });
+              fs.createReadStream(file).pipe(res);
+            });
+            return new Promise((resolve) => {
+              server.listen(0, '127.0.0.1', () => resolve(server));
+            });
+          }
+
+          async function captureRoute(context, baseUrl, route) {
+            const page = await context.newPage();
+            try {
+              await page.goto(baseUrl + route, { waitUntil: 'load', timeout: 30000 });
+              await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+              await page.waitForTimeout(500);
+              return await page.screenshot({ type: 'png' });
+            } finally {
+              await page.close();
+            }
+          }
+
+          async function main() {
+            const configResponse = await callApi('/config');
+            if (!configResponse.ok) {
+              throw new Error('Configuration de capture inaccessible (HTTP ' + configResponse.status + ').');
+            }
+            const config = await configResponse.json();
+
+            const root = path.resolve(WORKSPACE, config.webDir);
+            if (!isInside(WORKSPACE, root) || !fs.existsSync(path.join(root, 'index.html'))) {
+              throw new Error('index.html introuvable dans "' + config.webDir + '" : vérifiez le dossier de build web dans la fiche App Store.');
+            }
+
+            const server = await startStaticServer(root);
+            const baseUrl = 'http://127.0.0.1:' + server.address().port;
+            const browser = await chromium.launch();
+            try {
+              for (const profile of config.displayTypes) {
+                const context = await browser.newContext({
+                  viewport: profile.viewport,
+                  deviceScaleFactor: profile.deviceScaleFactor,
+                  isMobile: profile.isMobile,
+                });
+                for (let position = 0; position < config.routes.length; position++) {
+                  const route = config.routes[position];
+                  let png;
+                  try {
+                    png = await captureRoute(context, baseUrl, route);
+                  } catch (error) {
+                    throw new Error('Capture impossible de la route "' + route + '" : ' + error.message.split(String.fromCharCode(10))[0]);
+                  }
+                  const query = 'displayType=' + encodeURIComponent(profile.type) + '&route=' + encodeURIComponent(route) + '&position=' + position;
+                  const upload = await callApi('/shots?' + query, { method: 'PUT', headers: { 'Content-Type': 'image/png' }, body: png });
+                  if (!upload.ok) {
+                    throw new Error('Envoi refusé pour ' + profile.type + ' ' + route + ' (HTTP ' + upload.status + ').');
+                  }
+                  console.log('OK ' + profile.type + ' ' + route);
+                }
+                await context.close();
+              }
+            } finally {
+              await browser.close();
+              server.close();
+            }
+
+            const complete = await callApi('/complete', { method: 'POST' });
+            if (!complete.ok) {
+              throw new Error('Finalisation refusée (HTTP ' + complete.status + ').');
+            }
+          }
+
+          main().catch(async (error) => {
+            console.error('::error::' + error.message);
+            await callApi('/fail', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ message: error.message }),
+            }).catch(() => {});
+            process.exit(1);
+          });
+          MOBILEFLOW_CAPTURE_SCRIPT
+          cd "$RUNNER_TEMP/mobileflow-capture"
+          node capture.cjs
