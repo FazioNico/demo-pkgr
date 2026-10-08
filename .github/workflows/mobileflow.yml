@@ -22,6 +22,9 @@ on:
       logs_token:
         description: 'Token de run réutilisable pour pousser les logs de build en direct vers MobileFlow'
         required: true
+      app_version:
+        description: 'Version marketing iOS (CFBundleShortVersionString, ex. 1.2.0) ; vide pour conserver celle du projet Xcode'
+        required: false
 
 jobs:
   build-android:
@@ -212,7 +215,14 @@ jobs:
           echo "PROFILE_NAME=$PROFILE_NAME" >> "$GITHUB_ENV"
           echo "BUNDLE_ID=$BUNDLE_ID" >> "$GITHUB_ENV"
       - name: Build signed archive
+        env:
+          APP_VERSION: ${{ inputs.app_version }}
+          BUILD_NUMBER: ${{ github.run_number }}
         run: |
+          VERSION_ARGS=()
+          if [ -n "$APP_VERSION" ]; then
+            VERSION_ARGS+=("MARKETING_VERSION=$APP_VERSION")
+          fi
           xcodebuild -workspace ios/App/App.xcworkspace \
             -scheme App \
             -configuration Release \
@@ -223,7 +233,29 @@ jobs:
             DEVELOPMENT_TEAM="$TEAM_ID" \
             PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
             IPHONEOS_DEPLOYMENT_TARGET=16.0 \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            "${VERSION_ARGS[@]}" \
             archive 2>&1 | tee -a "$LOG_FILE"
+      - name: Verify bundle version
+        env:
+          APP_VERSION: ${{ inputs.app_version }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          set -o pipefail
+          {
+            APP_PLIST="$(ls -d "$RUNNER_TEMP"/App.xcarchive/Products/Applications/*.app | head -n 1)/Info.plist"
+            ACTUAL_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_PLIST")
+            ACTUAL_BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP_PLIST")
+            echo "Version de l'app : $ACTUAL_VERSION (build $ACTUAL_BUILD)"
+            if [ "$ACTUAL_BUILD" != "$BUILD_NUMBER" ]; then
+              echo "::error::Le numéro de build de l'app ($ACTUAL_BUILD) n'est pas celui demandé ($BUILD_NUMBER) : CFBundleVersion est probablement écrit en dur dans Info.plist au lieu de référencer CURRENT_PROJECT_VERSION."
+              exit 1
+            fi
+            if [ -n "$APP_VERSION" ] && [ "$ACTUAL_VERSION" != "$APP_VERSION" ]; then
+              echo "::error::La version de l'app ($ACTUAL_VERSION) n'est pas celle demandée ($APP_VERSION) : CFBundleShortVersionString est probablement écrit en dur dans Info.plist au lieu de référencer MARKETING_VERSION."
+              exit 1
+            fi
+          } 2>&1 | tee -a "$LOG_FILE"
       - name: Export IPA
         run: |
           {
